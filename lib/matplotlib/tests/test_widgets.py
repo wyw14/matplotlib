@@ -1168,6 +1168,136 @@ def test_CheckButtons(ax):
     check.disconnect(cid)
 
 
+def test_CheckButtons_set_active_batch(ax):
+    labels = ('a', 'b', 'c')
+    check = widgets.CheckButtons(
+        ax, labels, (True, False, True), useblit=False)
+    events = []
+
+    def record(label):
+        # Snapshot the label and the state visible to the callback.
+        events.append((label, check.get_status()))
+
+    check.on_clicked(record)
+
+    with mock.patch.object(check.canvas, 'draw') as draw:
+        # Mixed update given out of order: c stays checked, a is unchecked and
+        # b is checked; only the latter two actually change.
+        check.set_active_batch([2, 0, 1], [True, False, True])
+        # The whole batch triggers at most a single redraw.
+        assert draw.call_count == 1
+
+    assert check.get_status() == [False, True, True]
+    # Callbacks fire only for changed buttons, in the given index order, and
+    # every callback observes the state of the fully committed batch.
+    assert events == [('a', [False, True, True]), ('b', [False, True, True])]
+
+    events.clear()
+    with mock.patch.object(check.canvas, 'draw') as draw:
+        # Empty input does nothing.
+        check.set_active_batch([], [])
+        # States identical to the current ones do nothing.
+        check.set_active_batch([2, 0], [True, False])
+    assert events == []
+    assert draw.call_count == 0
+    assert check.get_status() == [False, True, True]
+
+    # A second batch in reverse order fires callbacks in that input order.
+    check.set_active_batch([1, 0], [False, True])
+    assert [label for label, _ in events] == ['b', 'a']
+    assert all(status == [True, False, True] for _, status in events)
+    assert check.get_status() == [True, False, True]
+
+
+@pytest.mark.parametrize(
+    "indices, states",
+    [([0, 3], [True, False]),          # index out of range
+     ([0, -1], [True, False]),         # negative index
+     ([2, 'x'], [True, False]),        # non-integer index
+     ([0, 0], [True, False]),          # repeated index
+     ([0, 1], [True, 1]),              # non-boolean state (after a valid one)
+     ([0], [True, False]),             # more states than indices
+     ([0, 1], [True])],                # fewer states than indices
+)
+def test_CheckButtons_set_active_batch_invalid(ax, indices, states):
+    check = widgets.CheckButtons(
+        ax, ('a', 'b', 'c'), (True, False, True), useblit=False)
+    before = check.get_status()
+    events = []
+    check.on_clicked(lambda label: events.append(label))
+
+    with mock.patch.object(check.canvas, 'draw') as draw:
+        with pytest.raises((ValueError, TypeError)):
+            check.set_active_batch(indices, states)
+
+    # The update is atomic: no state change, no redraw, no callbacks.
+    assert check.get_status() == before
+    assert events == []
+    assert draw.call_count == 0
+
+
+def test_CheckButtons_set_active_batch_switches(ax):
+    check = widgets.CheckButtons(
+        ax, ('a', 'b'), (True, False), useblit=False)
+    events = []
+    check.on_clicked(lambda label: events.append(label))
+
+    # drawon=False: state is committed and callbacks fire, but no redraw.
+    check.drawon = False
+    with mock.patch.object(check.canvas, 'draw') as draw:
+        check.set_active_batch([0, 1], [False, True])
+    assert check.get_status() == [False, True]
+    assert events == ['a', 'b']
+    assert draw.call_count == 0
+
+    # eventson=False: state is committed and the canvas redrawn, no callbacks.
+    check.drawon = True
+    check.eventson = False
+    events.clear()
+    with mock.patch.object(check.canvas, 'draw') as draw:
+        check.set_active_batch([0, 1], [True, False])
+    assert check.get_status() == [True, False]
+    assert events == []
+    assert draw.call_count == 1
+
+
+def test_CheckButtons_set_active_batch_blit(ax):
+    check = widgets.CheckButtons(
+        ax, ('a', 'b'), (False, False), useblit=True)
+    with mock.patch.object(type(check.canvas), 'supports_blit', True), \
+            mock.patch.object(check.canvas, 'draw') as draw, \
+            mock.patch.object(check.canvas, 'blit') as blit, \
+            mock.patch.object(check.ax, 'draw_artist') as draw_artist:
+        check.set_active_batch([0, 1], [True, True])
+    assert check.get_status() == [True, True]
+    # The blit path is used exactly once, instead of a full canvas redraw.
+    assert draw.call_count == 0
+    assert blit.call_count == 1
+    draw_artist.assert_called_once_with(check._buttons)
+
+
+def test_CheckButtons_set_active_batch_callback_error(ax):
+    check = widgets.CheckButtons(
+        ax, ('a', 'b', 'c'), (False, False, False), useblit=False)
+    events = []
+
+    def on_click(label):
+        events.append(label)
+        if label == 'a':
+            raise RuntimeError('boom')
+
+    check.on_clicked(on_click)
+
+    with mock.patch.object(check.canvas, 'draw') as draw:
+        with pytest.raises(RuntimeError, match='boom'):
+            check.set_active_batch([0, 1], [True, True])
+
+    # The exception propagates, but the already committed states are kept.
+    assert check.get_status() == [True, True, False]
+    assert events == ['a']
+    assert draw.call_count == 1
+
+
 @pytest.mark.parametrize("toolbar", ["none", "toolbar2", "toolmanager"])
 def test_TextBox(ax, toolbar):
     # Avoid "toolmanager is provisional" warning.

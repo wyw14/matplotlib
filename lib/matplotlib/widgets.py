@@ -1441,6 +1441,106 @@ class CheckButtons(_Buttons):
         if self.eventson:
             self._observers.process('clicked', self.labels[index].get_text())
 
+    def set_active_batch(self, indices, states):
+        """
+        Modify the states of multiple check buttons at once.
+
+        All *indices* and *states* are validated before any state is
+        modified: if any index is out of range, if an index is repeated, or
+        if a state is not boolean, no state is modified, nothing is drawn,
+        and no callbacks are triggered.
+
+        For valid input, all states are committed before the canvas is
+        redrawn (at most once) and before any callback is processed, so that
+        a callback calling `get_status` sees the fully updated state of the
+        whole batch. The *clicked* callbacks of the buttons whose state
+        actually changed are processed in the order given by *indices*.
+
+        Empty input, or input that does not change any state, does neither
+        redraw nor trigger callbacks.
+
+        Callbacks will be triggered if :attr:`!eventson` is True.
+
+        .. versionadded:: 3.12
+
+        Parameters
+        ----------
+        indices : iterable of int
+            Indices of the check buttons to modify. Indices must be valid
+            and must not be repeated.
+        states : iterable of bool
+            States to set for the corresponding *indices*. Must have the
+            same length as *indices*. Unlike `set_active`, toggling is not
+            supported: every state must be an explicit boolean.
+
+        Raises
+        ------
+        ValueError
+            If *indices* and *states* have different lengths, if an index is
+            invalid, or if an index is repeated.
+        TypeError
+            If any *state* is not boolean.
+        """
+        indices = list(indices)
+        states = list(states)
+
+        nbuttons = len(self.labels)
+        # Validate everything up-front, so that the update is atomic: an
+        # invalid input must not modify any state, draw, or fire callbacks.
+        if len(indices) != len(states):
+            raise ValueError(
+                'indices and states must have the same length, but got '
+                f'{len(indices)} indices and {len(states)} states'
+            )
+        for index in indices:
+            if index not in range(nbuttons):
+                raise ValueError(f'Invalid CheckButton index: {index}')
+        if len(set(indices)) != len(indices):
+            raise ValueError(f'indices must not be repeated: {indices}')
+        for i, state in enumerate(states):
+            _api.check_isinstance(bool, **{f"states[{i}]": state})
+
+        # Empty batch: nothing to commit, nothing to draw, no callbacks.
+        if not indices:
+            return
+
+        invisible = colors.to_rgba('none')
+        facecolors = self._buttons.get_facecolor()
+        # Compute the target state on a copy, leaving the actual state
+        # untouched until (and unless) at least one button changes.
+        target_colors = facecolors.copy()
+        changed = []
+        for index, state in zip(indices, states):
+            currently_active = not colors.same_color(
+                facecolors[index], invisible)
+            if state != currently_active:
+                changed.append(index)
+            target_colors[index] = (self._active_check_colors[index] if state
+                                    else invisible)
+
+        # No actual state change: don't redraw and don't fire callbacks.
+        if not changed:
+            return
+
+        # Commit the whole batch at once, before drawing or processing any
+        # callback, so that every callback observes the fully updated state.
+        self._buttons.set_facecolor(target_colors)
+
+        if self.drawon:
+            if self._useblit and self.canvas.supports_blit:
+                background = self._load_blit_background()
+                if background is not None:
+                    self.canvas.restore_region(background)
+                self.ax.draw_artist(self._buttons)
+                self.canvas.blit(self.ax.bbox)
+            else:
+                self.canvas.draw()
+
+        if self.eventson:
+            for index in changed:
+                self._observers.process(
+                    'clicked', self.labels[index].get_text())
+
     def _init_status(self, actives):
         """
         Initialize properties to match active status.
