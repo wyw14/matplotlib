@@ -1031,6 +1031,443 @@ class RangeSlider(SliderBase):
         return self._observers.connect('changed', lambda val: func(val))
 
 
+class MultiSlider(SliderBase):
+    """
+    A slider with multiple handles for editing ordered threshold values.
+
+    The slider represents several ordered values on a single numerical axis.
+    Each value has its own handle, which can be dragged independently.  A
+    handle can neither be dragged past its neighbouring handles nor outside of
+    the interval ``[valmin, valmax]``.  An optional *min_distance* enforces a
+    minimum spacing between neighbouring handles.  All bounds are checked on
+    the *valstep* grid, so the range and spacing constraints remain satisfied
+    after a dragged value gets snapped to a step.
+
+    For the slider to remain responsive you must maintain a reference to it.
+    Call :meth:`on_changed` to connect to the slider event.
+
+    Attributes
+    ----------
+    val : `~numpy.ndarray`
+        Sorted current values of all handles.
+    valinit : `~numpy.ndarray`
+        Sorted initial values of all handles.
+    """
+
+    def __init__(self, ax, label, valmin, valmax, *, valinit=None,
+                 valfmt=None, valstep=None, min_distance=0,
+                 orientation="horizontal", dragging=True,
+                 track_color='lightgrey', handle_style=None, **kwargs):
+        """
+        Parameters
+        ----------
+        ax : Axes
+            The Axes to put the slider in.
+
+        label : str
+            Slider label.
+
+        valmin : float
+            The minimum value of the slider.
+
+        valmax : float
+            The maximum value of the slider.
+
+        valinit : array-like of float or None, default: None
+            The initial positions of the handles, in ascending order.  If
+            None, three handles are placed at the 25th, 50th, and 75th
+            percentiles of the range.
+
+        valfmt : str or callable, default: None
+            The way to format the per-handle value labels. If a string, it
+            must be in %-format. If a callable, it must have the signature
+            ``valfmt(val: float) -> str``. If None, a `.ScalarFormatter` is
+            used.
+
+        valstep : float or array-like, default: None
+            If a float, the handles snap to multiples of *valstep*. If an
+            array, the handles snap to the values in the array.
+
+        min_distance : float, default: 0
+            Minimum allowed distance between neighbouring handles.  If zero,
+            handles are allowed to coincide.
+
+        orientation : {'horizontal', 'vertical'}, default: 'horizontal'
+            The orientation of the slider.
+
+        dragging : bool, default: True
+            If True the slider can be dragged by the mouse.
+
+        track_color : :mpltype:`color`, default: 'lightgrey'
+            The color of the background track. The track is accessible for
+            further styling via the *track* attribute.
+
+        handle_style : dict
+            Properties of the slider handles. Default values are
+
+            ========= ===== ======= =========================================
+            Key       Value Default Description
+            ========= ===== ======= =========================================
+            facecolor color 'white' The facecolor of the slider handles.
+            edgecolor color '.75'   The edgecolor of the slider handles.
+            size      int   10      The size of the slider handles in points.
+            ========= ===== ======= =========================================
+
+            Other values will be transformed as marker{foo} and passed to the
+            `~.Line2D` constructor. e.g. ``handle_style = {'style'='x'}`` will
+            result in ``markerstyle = 'x'``.
+
+        Notes
+        -----
+        Additional kwargs are passed on to ``self.track`` which is the
+        `~matplotlib.patches.Rectangle` that draws the slider track. See the
+        `.Rectangle` documentation for valid property names (``edgecolor``,
+        ``alpha``, etc.).
+        """
+        super().__init__(ax, orientation, True, True, valmin, valmax,
+                         valfmt, dragging, valstep)
+
+        self._eps = 1e-9 * max(1.0, abs(valmin), abs(valmax))
+        if not isinstance(min_distance, Number) or min_distance < 0:
+            raise ValueError(
+                f"'min_distance' must be a non-negative number, not "
+                f"{min_distance!r}")
+        self.min_distance = float(min_distance)
+
+        if valinit is None:
+            extent = valmax - valmin
+            valinit = np.array([valmin + extent * 0.25,
+                                valmin + extent * 0.50,
+                                valmin + extent * 0.75])
+        valinit = np.asarray(valinit, dtype=float)
+        if valinit.ndim != 1 or valinit.size < 2:
+            raise ValueError(
+                "'valinit' must be a 1-D sequence of at least two values")
+        if np.any(valinit < valmin) or np.any(valinit > valmax):
+            raise ValueError(
+                "all values of 'valinit' must lie between 'valmin' and "
+                "'valmax'")
+        if np.any(np.diff(valinit) < 0):
+            raise ValueError(
+                "'valinit' must be sorted in ascending order")
+        if np.any(np.diff(valinit) < self.min_distance - self._eps):
+            raise ValueError(
+                "neighbouring values of 'valinit' must be separated by at "
+                "least 'min_distance'")
+
+        # Set a value to allow the grid helpers to work.
+        self.val = valinit
+        vals = self._validate_grid(valinit)
+        self.val = vals
+        self.valinit = vals.copy()
+
+        defaults = {'facecolor': 'white', 'edgecolor': '.75', 'size': 10}
+        handle_style = {} if handle_style is None else handle_style
+        marker_props = {
+            f'marker{k}': v for k, v in {**defaults, **handle_style}.items()
+        }
+
+        n = vals.size
+        if orientation == "vertical":
+            self.track = Rectangle(
+                (.25, 0), .5, 1, transform=ax.transAxes,
+                **{'facecolor': track_color, **kwargs})
+            ax.add_patch(self.track)
+            label_transform = ax.get_yaxis_transform(which="grid")
+            # Alternate labels to the left and right of the track.
+            self._label_cross = [0.12 if i % 2 else 0.88 for i in range(n)]
+            self._handles = [
+                ax.plot([.5], [v], "o", **marker_props, clip_on=False)[0]
+                for v in vals
+            ]
+            self.val_labels = [
+                ax.text(self._label_cross[i], v, self._format(v),
+                        transform=label_transform,
+                        horizontalalignment="center",
+                        verticalalignment="center", clip_on=False)
+                for i, v in enumerate(vals)
+            ]
+            self.label = ax.text(
+                0.5, 1.02, label, transform=ax.transAxes,
+                verticalalignment="bottom", horizontalalignment="center")
+        else:
+            self.track = Rectangle(
+                (0, .25), 1, .5, transform=ax.transAxes,
+                **{'facecolor': track_color, **kwargs})
+            ax.add_patch(self.track)
+            label_transform = ax.get_xaxis_transform(which="grid")
+            # Alternate labels below and above the track.
+            self._label_cross = [0.12 if i % 2 else 0.88 for i in range(n)]
+            self._handles = [
+                ax.plot([v], [.5], "o", **marker_props, clip_on=False)[0]
+                for v in vals
+            ]
+            self.val_labels = [
+                ax.text(v, self._label_cross[i], self._format(v),
+                        transform=label_transform,
+                        horizontalalignment="center",
+                        verticalalignment="center", clip_on=False)
+                for i, v in enumerate(vals)
+            ]
+            self.label = ax.text(
+                -0.02, 0.5, label, transform=ax.transAxes,
+                verticalalignment="center", horizontalalignment="right")
+
+        self.drag_active = False
+        self._active_handle = None
+        self.set_val(vals)
+
+    def _validate_grid(self, valinit):
+        """
+        Validate *valstep*, check that a feasible placement exists and return
+        *valinit* snapped onto the step grid.
+
+        All checks happen before any artist of the slider is created.
+        """
+        n = valinit.size
+        d = self.min_distance
+        eps = self._eps
+        if isinstance(self.valstep, Number):
+            step = float(self.valstep)
+            if step <= 0:
+                raise ValueError("'valstep' must be positive")
+            self._kmax = int(np.floor(
+                (self.valmax - self.valmin) / step + eps))
+            kdelta = int(np.ceil(d / step - eps))
+            if (n - 1) * kdelta > self._kmax:
+                raise ValueError(
+                    "the slider range is too small to place all handles "
+                    "with the requested 'min_distance' and 'valstep'")
+            k = np.rint((valinit - self.valmin) / step).astype(int)
+            if (np.any(k < 0) or np.any(k > self._kmax)
+                    or np.any(np.diff(k) < kdelta)):
+                raise ValueError(
+                    "the 'valinit' values do not satisfy the bounds and "
+                    "'min_distance' after snapping to 'valstep'")
+            self._allowed = None
+            return self.valmin + k * step
+        if self.valstep is not None:
+            allowed = np.sort(np.asarray(self.valstep, dtype=float))
+            if allowed.ndim != 1 or allowed.size == 0:
+                raise ValueError(
+                    "'valstep' must be a non-empty 1-D sequence")
+            if np.any(np.diff(allowed) <= 0):
+                raise ValueError(
+                    "'valstep' array must be strictly increasing")
+            in_range = allowed[(allowed >= self.valmin - eps)
+                               & (allowed <= self.valmax + eps)]
+            if in_range.size == 0:
+                raise ValueError(
+                    "'valstep' contains no value within the slider range")
+            # Greedily pack the handles from the bottom of the grid.
+            cursor = in_range[0]
+            for _ in range(1, n):
+                j = np.searchsorted(in_range, cursor + d - eps)
+                if j >= in_range.size:
+                    raise ValueError(
+                        "the slider range is too small to place all handles "
+                        "with the requested 'min_distance' and 'valstep'")
+                cursor = in_range[j]
+            idx = np.argmin(
+                np.abs(in_range - valinit[:, None]), axis=1)
+            snapped = in_range[idx]
+            if (np.any(np.diff(snapped) < d - eps)
+                    or np.any(snapped < self.valmin - eps)
+                    or np.any(snapped > self.valmax + eps)):
+                raise ValueError(
+                    "the 'valinit' values do not satisfy the bounds and "
+                    "'min_distance' after snapping to 'valstep'")
+            self._kmax = None
+            self._allowed = in_range
+            return snapped
+        if self.valmin + (n - 1) * d > self.valmax + eps:
+            raise ValueError(
+                "the slider range is too small to place all handles with "
+                "the requested 'min_distance'")
+        self._kmax = None
+        self._allowed = None
+        return valinit.copy()
+
+    def _snap(self, val):
+        """Snap *val* to the closest position on the step grid."""
+        if isinstance(self.valstep, Number):
+            k = int(np.rint((val - self.valmin) / self.valstep))
+            k = min(max(k, 0), self._kmax)
+            return self.valmin + k * self.valstep
+        if self._allowed is not None:
+            j = int(np.argmin(np.abs(self._allowed - val)))
+            return self._allowed[j]
+        return float(val)
+
+    def _ceil(self, val):
+        """Smallest position on the step grid that is >= *val*."""
+        if isinstance(self.valstep, Number):
+            k = int(np.ceil(
+                (val - self.valmin) / self.valstep - self._eps))
+            k = min(max(k, 0), self._kmax)
+            return self.valmin + k * self.valstep
+        if self._allowed is not None:
+            j = int(np.searchsorted(self._allowed, val - self._eps))
+            j = min(max(j, 0), self._allowed.size - 1)
+            return self._allowed[j]
+        return float(val)
+
+    def _floor(self, val):
+        """Largest position on the step grid that is <= *val*."""
+        if isinstance(self.valstep, Number):
+            k = int(np.floor(
+                (val - self.valmin) / self.valstep + self._eps))
+            k = min(max(k, 0), self._kmax)
+            return self.valmin + k * self.valstep
+        if self._allowed is not None:
+            j = int(np.searchsorted(
+                self._allowed, val + self._eps, side="right") - 1)
+            j = min(max(j, 0), self._allowed.size - 1)
+            return self._allowed[j]
+        return float(val)
+
+    def _select_handle(self, pos):
+        """
+        Return the index of the handle that should be grabbed at *pos*.
+
+        The handle closest to *pos* is selected.  If several handles coincide
+        and are equally close (only possible with ``min_distance=0``), the
+        selection is stable and directional: the handle on the side of the
+        stack towards the cursor is picked (the highest index when the cursor
+        is above/right, the lowest index when it is below/left); exactly on
+        top of the stack the lowest index is picked.
+        """
+        distances = np.abs(self.val - pos)
+        index = int(np.argmin(distances))
+        tied = np.flatnonzero(distances == distances[index])
+        if tied.size > 1 and pos > self.val[index]:
+            index = int(tied[-1])
+        return index
+
+    def _clamped_value(self, index, pos):
+        """
+        Snap *pos* to the grid and clamp it so that handle *index* neither
+        leaves the slider range nor gets closer than *min_distance* to its
+        neighbours.  The other handles are left untouched.
+        """
+        lower = (self.valmin if index == 0
+                 else self.val[index - 1] + self.min_distance)
+        upper = (self.valmax if index == self.val.size - 1
+                 else self.val[index + 1] - self.min_distance)
+        return min(self._floor(upper),
+                   max(self._ceil(lower), self._snap(pos)))
+
+    @_call_with_reparented_event
+    def _update(self, event):
+        """Update the slider position."""
+        if self.ignore(event) or event.button != 1:
+            return
+
+        if (event.name == "button_press_event"
+                and self.ax.contains(event)[0]):
+            pos = (event.xdata if self.orientation == "horizontal"
+                   else event.ydata)
+            # The selected handle is fixed for the whole drag gesture so
+            # that coinciding handles cannot swap while being dragged.
+            self._active_handle = self._select_handle(pos)
+            self.drag_active = True
+            event.canvas.grab_mouse(self.ax)
+
+        if not self.drag_active:
+            return
+
+        if (event.name == "button_release_event"
+                or event.name == "button_press_event"
+                   and not self.ax.contains(event)[0]):
+            self.drag_active = False
+            self._active_handle = None
+            event.canvas.release_mouse(self.ax)
+            return
+
+        pos = (event.xdata if self.orientation == "horizontal"
+               else event.ydata)
+        index = self._active_handle
+        val = self._clamped_value(index, pos)
+        if val != self.val[index]:
+            new_vals = self.val.copy()
+            new_vals[index] = val
+            self.set_val(new_vals)
+
+    def _format(self, val):
+        """Pretty-print *val*."""
+        if self.valfmt is not None:
+            if callable(self.valfmt):
+                return self.valfmt(val)
+            else:
+                return self.valfmt % val
+        else:
+            _, s, _ = self._fmt.format_ticks([self.valmin, val, self.valmax])
+            # fmt.get_offset is actually the multiplicative factor, if any.
+            return s + self._fmt.get_offset()
+
+    def set_val(self, vals):
+        """
+        Set the values of all handles to *vals*.
+
+        The values are independently snapped to the *valstep* grid, sorted,
+        clipped to the slider range and spaced by at least *min_distance*.
+
+        Parameters
+        ----------
+        vals : array-like of float
+            New value for each handle.
+        """
+        vals = np.asarray(vals, dtype=float)
+        _api.check_shape((self.val.size,), vals=vals)
+        vals = np.sort([self._snap(v) for v in vals])
+        # Keep the outer handles within the slider range.
+        vals[0] = max(vals[0], self._ceil(self.valmin))
+        vals[-1] = min(vals[-1], self._floor(self.valmax))
+        # Enforce min_distance between neighbouring handles.
+        for i in range(1, vals.size):
+            vals[i] = max(
+                vals[i], self._ceil(vals[i - 1] + self.min_distance))
+        if vals[-1] > self.valmax + self._eps:
+            raise ValueError(
+                "the requested values cannot be placed within the range "
+                "and 'min_distance'")
+        self._apply(vals)
+
+    def _apply(self, vals):
+        """Update the artists, state and observers from feasible *vals*."""
+        for i, val in enumerate(vals):
+            if self.orientation == "vertical":
+                self._handles[i].set_ydata([val])
+                self.val_labels[i].set_position((self._label_cross[i], val))
+            else:
+                self._handles[i].set_xdata([val])
+                self.val_labels[i].set_position((val, self._label_cross[i]))
+            self.val_labels[i].set_text(self._format(val))
+        if self.drawon:
+            self.ax.get_figure(root=True).canvas.draw_idle()
+        self.val = vals
+        if self.eventson:
+            self._observers.process("changed", vals.copy())
+
+    def on_changed(self, func):
+        """
+        Connect *func* as callback function to changes of the slider value.
+
+        Parameters
+        ----------
+        func : callable
+            Function to call when any slider value is changed. The function
+            must accept a single `~numpy.ndarray` containing the values of
+            all handles.
+
+        Returns
+        -------
+        int
+            Connection id (which can be used to disconnect *func*).
+        """
+        return self._observers.connect('changed', lambda val: func(val))
+
+
 def _expand_text_props(props):
     props = cbook.normalize_kwargs(props, mtext.Text)
     return cycler(**props)() if props else itertools.repeat({})

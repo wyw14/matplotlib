@@ -1501,6 +1501,287 @@ def test_range_slider_same_init_values(orientation):
     assert_allclose(box.get_points().flatten()[idx], [0, 0.25, 0, 0.75])
 
 
+def _multi_slider_event(ax, orientation, name, value, button=1):
+    """Emit a synthetic mouse event at slider value *value*."""
+    xy = (value, 0.5) if orientation == "horizontal" else (0.5, value)
+    MouseEvent._from_ax_coords(name, ax, xy, button)._process()
+
+
+def _multi_slider_handle_positions(slider):
+    if slider.orientation == "vertical":
+        return [h.get_ydata()[0] for h in slider._handles]
+    return [h.get_xdata()[0] for h in slider._handles]
+
+
+@pytest.mark.parametrize("orientation", ["horizontal", "vertical"])
+def test_multi_slider(orientation):
+    fig, ax = plt.subplots()
+    slider = widgets.MultiSlider(
+        ax=ax, label="", valmin=0.0, valmax=10.0,
+        valinit=[1, 4, 8], valfmt="%1.1f", orientation=orientation)
+    fig.canvas.draw()
+
+    assert_allclose(slider.val, [1, 4, 8])
+    assert_allclose(slider.valinit, [1, 4, 8])
+    assert len(slider._handles) == 3
+    assert len(slider.val_labels) == 3
+    assert_allclose(_multi_slider_handle_positions(slider), [1, 4, 8])
+
+    slider.set_val([2, 5, 9])
+    assert_allclose(slider.val, [2, 5, 9])
+    assert_allclose(_multi_slider_handle_positions(slider), [2, 5, 9])
+    assert [t.get_text() for t in slider.val_labels] == ["2.0", "5.0", "9.0"]
+
+    slider.set_val([9, 2, 5])  # values are sorted, like for RangeSlider
+    assert_allclose(slider.val, [2, 5, 9])
+    assert_allclose(_multi_slider_handle_positions(slider), [2, 5, 9])
+
+    slider.reset()
+    assert_allclose(slider.val, [1, 4, 8])
+    assert_allclose(_multi_slider_handle_positions(slider), [1, 4, 8])
+
+    # Default initial values: three handles at 25/50/75 percent.
+    fig, ax = plt.subplots()
+    slider = widgets.MultiSlider(ax=ax, label="", valmin=0.0, valmax=10.0)
+    assert_allclose(slider.val, [2.5, 5.0, 7.5])
+
+
+def test_multi_slider_invalid_args():
+    fig, ax = plt.subplots()
+
+    def make(*, valmin=0.0, valmax=10.0, **kwargs):
+        return widgets.MultiSlider(
+            ax=ax, label="", valmin=valmin, valmax=valmax, **kwargs)
+
+    with pytest.raises(ValueError):
+        make(valinit=[-1, 5, 9])                    # below valmin
+    with pytest.raises(ValueError):
+        make(valinit=[1, 5, 11])                    # above valmax
+    with pytest.raises(ValueError):
+        make(valinit=[8, 4, 1])                     # not sorted
+    with pytest.raises(ValueError):
+        make(valinit=[1, 2], min_distance=2)        # too close
+    with pytest.raises(ValueError):
+        make(valinit=[1])                          # too few handles
+    with pytest.raises(ValueError):
+        make(valinit=[1, 4, 8], min_distance=-1)   # negative spacing
+    with pytest.raises(ValueError):
+        make(valmin=0.0, valmax=1.0,
+             valinit=[0, .5, 1], min_distance=.6)  # infeasible range
+    with pytest.raises(ValueError):
+        make(valinit=[1, 4, 8], valstep=0)         # non-positive step
+    with pytest.raises(ValueError):
+        make(valinit=[0, 3, 6],
+             valstep=[0, 3, 3, 6])                 # non-unique step array
+    with pytest.raises(ValueError):
+        make(valinit=[1, 4, 8], valstep=[11, 12])  # no step value in range
+
+    # The raw initial values are valid, but snapping breaks min_distance.
+    with pytest.raises(ValueError):
+        make(valinit=[0, 2.6, 5.2], valstep=1, min_distance=2.5)
+    # Snapping the last handle would move it beyond valmax.
+    with pytest.raises(ValueError):
+        make(valmin=0.0, valmax=0.8, valinit=[0, .4, .8], valstep=.3)
+    # Not enough room on the step grid for all handles.
+    with pytest.raises(ValueError):
+        make(valinit=[0, 5, 10], valstep=3, min_distance=5)
+    # Not enough room on the step array for all handles.
+    with pytest.raises(ValueError):
+        make(valinit=[0, 5, 10], valstep=[0, 3, 6, 9], min_distance=4)
+
+
+@pytest.mark.parametrize("orientation", ["horizontal", "vertical"])
+def test_multi_slider_drag(orientation):
+    fig, ax = plt.subplots()
+    slider = widgets.MultiSlider(
+        ax=ax, label="", valmin=0.0, valmax=10.0,
+        valinit=[2, 5, 8], min_distance=1, orientation=orientation)
+    fig.canvas.draw()
+    changes = []
+    slider.on_changed(lambda vals: changes.append(vals.copy()))
+
+    def event(name, value):
+        _multi_slider_event(ax, orientation, name, value)
+
+    # Drag handle 0 far to the right: it is clamped at handle 1 - distance
+    # and handles 1 and 2 do not move.
+    event("button_press_event", 2)
+    event("motion_notify_event", 9)
+    assert_allclose(slider.val, [4, 5, 8])
+    assert_allclose(_multi_slider_handle_positions(slider), [4, 5, 8])
+    event("button_release_event", 9)
+
+    # Drag the last handle beyond valmax: clamped to the boundary.
+    event("button_press_event", 8)
+    event("motion_notify_event", 100)
+    assert_allclose(slider.val, [4, 5, 10])
+    event("button_release_event", 100)
+
+    # Handle 1 cannot move left (handle 0 is already exactly one step away);
+    # no value change and therefore no change callback.
+    event("button_press_event", 5)
+    event("motion_notify_event", -10)
+    assert_allclose(slider.val, [4, 5, 10])
+    event("button_release_event", -10)
+
+    # Drag the first handle below valmin: clamped to the boundary.
+    event("button_press_event", 4)
+    event("motion_notify_event", 0)
+    assert_allclose(slider.val, [0, 5, 10])
+    event("button_release_event", 0)
+
+    # Drag the middle handle next to the last one: clamped at last - distance.
+    event("button_press_event", 5)
+    event("motion_notify_event", 9)
+    assert_allclose(slider.val, [0, 9, 10])
+    event("button_release_event", 9)
+
+    # Only the four actual changes triggered a callback; press, release and
+    # no-op motions did not.  Every callback received all thresholds.
+    assert len(changes) == 4
+    assert all(isinstance(vals, np.ndarray) and vals.size == 3
+               for vals in changes)
+
+
+@pytest.mark.parametrize("orientation", ["horizontal", "vertical"])
+def test_multi_slider_coincident_handles(orientation):
+    fig, ax = plt.subplots()
+    slider = widgets.MultiSlider(
+        ax=ax, label="", valmin=0.0, valmax=10.0,
+        valinit=[4, 4, 8], min_distance=0, orientation=orientation)
+    fig.canvas.draw()
+
+    # Stable tie-breaking for the coincident handles.
+    assert slider._select_handle(4.0) == 0     # exactly on top: lowest index
+    assert slider._select_handle(4.0) == 0     # ... repeatedly
+    assert slider._select_handle(3.9) == 0     # below/left of the stack
+    assert slider._select_handle(4.1) == 1     # above/right of the stack
+    assert slider._select_handle(7.5) == 2
+
+    def event(name, value):
+        _multi_slider_event(ax, orientation, name, value)
+
+    # Click slightly above/right of the stack: handle 1 is selected and can
+    # be peeled off, handle 0 stays put.
+    event("button_press_event", 4.1)
+    event("motion_notify_event", 6)
+    assert_allclose(slider.val, [4, 6, 8])
+    positions = _multi_slider_handle_positions(slider)
+    assert_allclose(positions, [4, 6, 8])
+    event("button_release_event", 6)
+
+    # Click exactly on top of the stack: the lowest-index handle is selected.
+    slider.reset()
+    event("button_press_event", 4)
+    event("motion_notify_event", 2)
+    assert_allclose(slider.val, [2, 4, 8])
+    event("button_release_event", 2)
+
+
+@pytest.mark.parametrize("orientation", ["horizontal", "vertical"])
+def test_multi_slider_disabled(orientation):
+    fig, ax = plt.subplots()
+    slider = widgets.MultiSlider(
+        ax=ax, label="", valmin=0.0, valmax=10.0,
+        valinit=[2, 5, 8], min_distance=1, orientation=orientation)
+    fig.canvas.draw()
+
+    slider.set_active(False)
+    _multi_slider_event(ax, orientation, "button_press_event", 2)
+    _multi_slider_event(ax, orientation, "motion_notify_event", 9)
+    assert_allclose(slider.val, [2, 5, 8])
+
+    slider.set_active(True)
+    _multi_slider_event(ax, orientation, "button_press_event", 2)
+    _multi_slider_event(ax, orientation, "motion_notify_event", 9)
+    assert_allclose(slider.val, [4, 5, 8])
+    _multi_slider_event(ax, orientation, "button_release_event", 9)
+
+
+@pytest.mark.parametrize("orientation", ["horizontal", "vertical"])
+def test_multi_slider_programmatic_vs_interactive(orientation):
+    fig_i, ax_i = plt.subplots()
+    s_interactive = widgets.MultiSlider(
+        ax=ax_i, label="", valmin=0.0, valmax=10.0,
+        valinit=[2, 5, 8], min_distance=1, orientation=orientation)
+    fig_i.canvas.draw()
+    _multi_slider_event(ax_i, orientation, "button_press_event", 5)
+    _multi_slider_event(ax_i, orientation, "motion_notify_event", 9)
+    # Clamped to handle 2 - min_distance.
+    assert_allclose(s_interactive.val, [2, 7, 8])
+    _multi_slider_event(ax_i, orientation, "button_release_event", 9)
+
+    fig_p, ax_p = plt.subplots()
+    s_programmatic = widgets.MultiSlider(
+        ax=ax_p, label="", valmin=0.0, valmax=10.0,
+        valinit=[2, 5, 8], min_distance=1, orientation=orientation)
+    s_programmatic.set_val(s_interactive.val)
+
+    assert_allclose(s_programmatic.val, s_interactive.val)
+    assert_allclose(_multi_slider_handle_positions(s_programmatic),
+                    _multi_slider_handle_positions(s_interactive))
+    assert ([t.get_text() for t in s_programmatic.val_labels]
+            == [t.get_text() for t in s_interactive.val_labels])
+
+    # Out-of-range programmatic values are clamped to the boundaries.
+    s_programmatic.set_val([-5, 5, 50])
+    assert_allclose(s_programmatic.val, [0, 5, 10])
+    # min_distance is enforced between neighbouring handles.
+    s_programmatic.set_val([0, 0.2, 10])
+    assert_allclose(s_programmatic.val, [0, 1, 10])
+    # Wrong number of values raises.
+    with pytest.raises(ValueError):
+        s_programmatic.set_val([1, 2])
+
+
+def test_multi_slider_valstep():
+    # Scalar step: spacing is enforced on the grid after snapping.
+    fig, ax = plt.subplots()
+    slider = widgets.MultiSlider(
+        ax=ax, label="", valmin=0.0, valmax=10.0,
+        valinit=[0, 3, 6], valstep=1, min_distance=2.5)
+    fig.canvas.draw()
+
+    # The middle handle has no feasible grid neighbour position: it stays.
+    assert slider._clamped_value(1, 4) == 3
+    assert slider._clamped_value(1, 2) == 3
+    # The last handle can still move on the grid.
+    assert_allclose(slider._clamped_value(2, 10), 10)
+
+    # The upper boundary is a valid grid position below valmax when valmax
+    # itself is not on the grid.
+    fig, ax = plt.subplots()
+    slider = widgets.MultiSlider(
+        ax=ax, label="", valmin=0.0, valmax=1.0,
+        valinit=[0, .3, .6], valstep=.3)
+    slider.set_val([0, .3, 5])
+    assert_allclose(slider.val, [0, .3, .9])
+    assert_allclose(_multi_slider_handle_positions(slider), [0, .3, .9])
+    slider.set_val([-5, .3, .6])
+    assert_allclose(slider.val, [0, .3, .6])
+
+    # Array-like step: handles snap to the closest allowed value and the
+    # spacing is checked against the allowed values.
+    fig, ax = plt.subplots()
+    slider = widgets.MultiSlider(
+        ax=ax, label="", valmin=0.0, valmax=10.0,
+        valinit=[2, 6, 8], valstep=[0, 2, 4, 6, 8, 10])
+    fig.canvas.draw()
+    _multi_slider_event(ax, "horizontal", "button_press_event", 6)
+    _multi_slider_event(ax, "horizontal", "motion_notify_event", 5)
+    assert_allclose(slider.val, [2, 4, 8])
+    _multi_slider_event(ax, "horizontal", "button_release_event", 5)
+
+    fig, ax = plt.subplots()
+    slider = widgets.MultiSlider(
+        ax=ax, label="", valmin=0.0, valmax=10.0,
+        valinit=[0, 4, 8], valstep=[0, 2, 4, 6, 8, 10],
+        min_distance=3)
+    # The middle handle cannot leave the [4] slot given its neighbours.
+    assert slider._clamped_value(1, 2) == 4
+    assert slider._clamped_value(1, 10) == 4
+
+
 def check_polygon_selector(events, expected, selections_count, **kwargs):
     """
     Helper function to test Polygon Selector.

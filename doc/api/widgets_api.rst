@@ -33,6 +33,7 @@ Widget classes
    SliderBase
    Slider
    RangeSlider
+   MultiSlider
    TextBox
    _SelectorWidget
    RectangleSelector
