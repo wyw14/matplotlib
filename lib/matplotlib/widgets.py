@@ -1500,6 +1500,10 @@ class TextBox(AxesWidget):
     Call `.on_submit` to be updated whenever the user hits enter or
     leaves the text entry field.
 
+    If *history* is enabled, non-empty submissions are kept (most recent
+    last) and can be recalled with the up/down arrow keys while the text box
+    has focus.  See `.get_history`, `.append_history`, and `.clear_history`.
+
     Attributes
     ----------
     ax : `~matplotlib.axes.Axes`
@@ -1514,7 +1518,7 @@ class TextBox(AxesWidget):
 
     def __init__(self, ax, label, initial='', *,
                  color='.95', hovercolor='1', label_pad=.01,
-                 textalignment="left"):
+                 textalignment="left", history=False, history_length=100):
         """
         Parameters
         ----------
@@ -1532,7 +1536,24 @@ class TextBox(AxesWidget):
             The distance between the label and the right side of the textbox.
         textalignment : {'left', 'center', 'right'}
             The horizontal location of the text.
+        history : bool, default: False
+            Whether to keep a history of non-empty submissions that can be
+            browsed with the up/down arrow keys while the text box has focus.
+            Browsing never triggers ``on_submit``; pressing enter with a
+            (possibly edited) history entry creates a new submission.
+        history_length : int, default: 100
+            Maximum number of entries kept in the history when *history* is
+            enabled.  If more entries are submitted, the oldest ones are
+            discarded.  Submitting the same text as the previous entry does
+            not add a duplicate entry.
         """
+        _api.check_isinstance(bool, history=history)
+        if (not isinstance(history_length, int)
+                or isinstance(history_length, bool)
+                or history_length < 1):
+            raise ValueError(
+                "history_length must be a positive integer, not "
+                f"{history_length!r}")
         super().__init__(ax)
 
         self._text_position = _api.getitem_checked(
@@ -1571,6 +1592,17 @@ class TextBox(AxesWidget):
         self.hovercolor = hovercolor
 
         self.capturekeystrokes = False
+
+        self._history_enabled = history
+        self._history_length = history_length
+        # Submitted non-empty texts, oldest first.
+        self._history = []
+        # Index of the history entry currently shown while browsing, or None
+        # when the user is editing the normal (draft) line.
+        self._histidx = None
+        # Unsubmitted text saved when browsing starts; restored by moving
+        # past the most recent history entry.
+        self._history_draft = None
 
     @property
     def text(self):
@@ -1649,14 +1681,86 @@ class TextBox(AxesWidget):
                 if self.cursor_index != len(self.text):
                     text = (text[:self.cursor_index] +
                             text[self.cursor_index + 1:])
+            elif key == "up" and self._history_enabled:
+                # Browsing handles rendering and change callbacks itself, and
+                # never triggers a submit.
+                self._history_backward()
+                return
+            elif key == "down" and self._history_enabled:
+                self._history_forward()
+                return
             self.text_disp.set_text(text)
             self._rendercursor()
             if self.eventson:
                 self._observers.process('change', self.text)
                 if key in ["enter", "return"]:
-                    self._observers.process('submit', self.text)
+                    self._submit()
 
-    def set_val(self, val):
+    def _show_history_text(self, text):
+        """Display a history (or draft) text and notify of the change."""
+        self.text_disp.set_text(text)
+        self.cursor_index = len(text)
+        self._rendercursor()
+        if self.eventson:
+            self._observers.process('change', self.text)
+
+    def _history_backward(self):
+        """Show the previous (older) submission; return whether text moved."""
+        if not self._history:
+            return False
+        if self._histidx is None:
+            # Save the unsubmitted draft before leaving it for the first
+            # time, then show the most recent submission.
+            self._history_draft = self.text
+            self._histidx = len(self._history) - 1
+        elif self._histidx > 0:
+            self._histidx -= 1
+        else:
+            return False  # Already at the oldest entry.
+        self._show_history_text(self._history[self._histidx])
+        return True
+
+    def _history_forward(self):
+        """Show the next (newer) submission, or the draft; return status."""
+        if self._histidx is None:
+            return False  # Already editing the draft line.
+        if self._histidx == len(self._history) - 1:
+            # Moving past the newest entry restores the draft and leaves
+            # history browsing.
+            text = self._history_draft
+            self._history_draft = None
+            self._histidx = None
+        else:
+            self._histidx += 1
+            text = self._history[self._histidx]
+        self._show_history_text(text)
+        return True
+
+    def _stop_history_navigation(self):
+        """Leave history browsing, keeping the currently visible text."""
+        self._histidx = None
+        self._history_draft = None
+
+    def _submit(self):
+        """Record the current text as a submission and notify observers."""
+        if self._history_enabled:
+            self.append_history(self.text)
+        self._stop_history_navigation()
+        self._observers.process('submit', self.text)
+
+    def set_val(self, val, *, add_history=False):
+        """
+        Set the value of the textbox.
+
+        Parameters
+        ----------
+        val : str
+            Value to set.
+        add_history : bool, default: False
+            Whether the value should also be added to the submission history
+            (when history is enabled).  By default, programmatically setting
+            the value does not record it as a submission.
+        """
         newval = str(val)
         if self.text == newval:
             return
@@ -1664,6 +1768,8 @@ class TextBox(AxesWidget):
         self._rendercursor()
         if self.eventson:
             self._observers.process('change', self.text)
+            if add_history and self._history_enabled:
+                self.append_history(self.text)
             self._observers.process('submit', self.text)
 
     def begin_typing(self):
@@ -1697,10 +1803,31 @@ class TextBox(AxesWidget):
         self.capturekeystrokes = False
         self.cursor.set_visible(False)
         self.ax.get_figure(root=True).canvas.draw()
-        if notifysubmit and self.eventson:
-            # Because process() might throw an error in the user's code, only
-            # call it once we've already done our cleanup.
-            self._observers.process('submit', self.text)
+        # Leaving the text box ends any history browsing; the currently
+        # visible text becomes the draft for the next editing session.
+        self._stop_history_navigation()
+        if notifysubmit:
+            if self._history_enabled:
+                self.append_history(self.text)
+            if self.eventson:
+                # Because process() might throw an error in the user's code,
+                # only call it once we've already done our cleanup.
+                self._observers.process('submit', self.text)
+
+    def set_active(self, active):
+        # docstring inherited
+        if not active:
+            # Disabling behaves like leaving the text box: any ongoing history
+            # browsing ends and the currently visible text is kept as draft.
+            if self.capturekeystrokes:
+                self.stop_typing()
+            else:
+                self._stop_history_navigation()
+        super().set_active(active)
+
+    # The base class defines ``active`` as a property whose setter is bound to
+    # the base ``set_active``; re-declare it so the override above is used.
+    active = property(Widget.active.fget, set_active)
 
     @_call_with_reparented_event
     def _click(self, event):
@@ -1747,6 +1874,42 @@ class TextBox(AxesWidget):
         A connection id is returned which can be used to disconnect.
         """
         return self._observers.connect('submit', lambda text: func(text))
+
+    def get_history(self):
+        """
+        Return a copy of the submission history, oldest first.
+
+        The returned list can be modified freely without affecting the
+        text box.
+        """
+        return list(self._history)
+
+    def append_history(self, text):
+        """
+        Append *text* to the submission history (ordered oldest first).
+
+        - Empty strings are ignored.
+        - If *text* equals the most recent entry, it is not added again
+          (adjacent duplicates are merged).
+        - If the history would exceed its maximum length, the oldest entries
+          are discarded.
+
+        This works even if history navigation was not enabled when the text
+        box was created.
+        """
+        text = str(text)
+        if not text:
+            return
+        if self._history and self._history[-1] == text:
+            return
+        self._history.append(text)
+        if len(self._history) > self._history_length:
+            del self._history[:len(self._history) - self._history_length]
+
+    def clear_history(self):
+        """Remove all entries from the submission history."""
+        self._history.clear()
+        self._stop_history_navigation()
 
     def disconnect(self, cid):
         """Remove the observer with connection id *cid*."""

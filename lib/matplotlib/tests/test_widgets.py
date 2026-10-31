@@ -1202,6 +1202,296 @@ def test_TextBox(ax, toolbar):
     ResizeEvent("resize_event", ax.figure.canvas)._process()  # smoke test
 
 
+def _textbox_focus(ax):
+    # Click into the text box so that it captures keystrokes.
+    MouseEvent._from_ax_coords("button_press_event", ax, (.5, .5), 1)._process()
+
+
+def _textbox_blur(ax):
+    # Click outside the text box, which stops typing (and submits).
+    MouseEvent._from_ax_coords("button_press_event", ax, (2, 2), 1)._process()
+
+
+def _textbox_press(ax, key):
+    KeyEvent("key_press_event", ax.figure.canvas, key)._process()
+
+
+def test_TextBox_history_validation(ax):
+    for bad in [0, -1, 2.0, '3', True]:
+        with pytest.raises(ValueError):
+            widgets.TextBox(ax, '', history_length=bad)
+    with pytest.raises(TypeError):
+        widgets.TextBox(ax, '', history=1)
+
+
+def test_TextBox_history_api(ax):
+    # History is disabled by default, but the buffer starts empty.
+    tool = widgets.TextBox(ax, '')
+    assert not tool._history_enabled
+    assert tool.get_history() == []
+
+    # Public API works even when navigation is disabled.
+    tool.append_history('a')
+    tool.append_history('b')
+    tool.append_history('b')  # adjacent duplicates are merged
+    tool.append_history('')   # empty strings are ignored
+    assert tool.get_history() == ['a', 'b']
+    tool.append_history('a')  # non-adjacent duplicate is kept
+    assert tool.get_history() == ['a', 'b', 'a']
+
+    # get_history returns an independent copy.
+    history = tool.get_history()
+    history.append('c')
+    assert tool.get_history() == ['a', 'b', 'a']
+
+    tool.clear_history()
+    assert tool.get_history() == []
+
+    # Capacity eviction discards the oldest entries.
+    capped = widgets.TextBox(get_ax(), '', history=True, history_length=2)
+    capped.append_history('one')
+    capped.append_history('two')
+    capped.append_history('three')
+    assert capped.get_history() == ['two', 'three']
+
+
+def test_TextBox_history_disabled(ax):
+    submit_event = mock.Mock(spec=noop, return_value=None)
+    change_event = mock.Mock(spec=noop, return_value=None)
+    tool = widgets.TextBox(ax, '')
+    tool.on_submit(submit_event)
+    tool.on_text_change(change_event)
+
+    _textbox_focus(ax)
+    tool.append_history('a')  # may be managed manually, but never navigated
+    change_event.reset_mock()
+
+    # With the feature off, up/down never navigate into the history.
+    _textbox_press(ax, 'up')
+    _textbox_press(ax, 'down')
+    assert tool.text == ''
+    submit_event.assert_not_called()
+    assert tool._histidx is None
+    assert tool.get_history() == ['a']
+
+
+def test_TextBox_history_navigation(ax):
+    submit_event = mock.Mock(spec=noop, return_value=None)
+    change_event = mock.Mock(spec=noop, return_value=None)
+    tool = widgets.TextBox(ax, '', history=True)
+    tool.on_submit(submit_event)
+    tool.on_text_change(change_event)
+
+    _textbox_focus(ax)
+
+    # Two real submissions; empty submissions are not recorded later.
+    _textbox_press(ax, 'a')
+    _textbox_press(ax, 'enter')
+    _textbox_press(ax, 'backspace')  # clear the line kept after submit
+    _textbox_press(ax, 'b')
+    _textbox_press(ax, 'enter')
+    assert tool.get_history() == ['a', 'b']
+    assert submit_event.call_args_list == [mock.call('a'), mock.call('b')]
+    submit_event.reset_mock()
+    change_event.reset_mock()
+
+    # Type an unsubmitted draft, then browse away from it.
+    _textbox_press(ax, 'backspace')  # clear the line kept after submit
+    _textbox_press(ax, 'd')
+    assert tool.text == 'd'
+    _textbox_press(ax, 'up')
+    assert tool.text == 'b'
+    assert tool.cursor_index == 1
+    _textbox_press(ax, 'up')
+    assert tool.text == 'a'
+
+    # Already at the oldest entry: no movement and no callbacks.
+    change_event.reset_mock()
+    submit_event.reset_mock()
+    _textbox_press(ax, 'up')
+    assert tool.text == 'a'
+    change_event.assert_not_called()
+    submit_event.assert_not_called()
+
+    # Moving forward and past the newest entry restores the saved draft.
+    _textbox_press(ax, 'down')
+    assert tool.text == 'b'
+    _textbox_press(ax, 'down')
+    assert tool.text == 'd'
+    assert tool._histidx is None
+    assert tool._history_draft is None
+    submit_event.assert_not_called()
+
+    # Navigation fires 'change' (the visible text changed) but never 'submit'.
+    change_event.reset_mock()
+    _textbox_press(ax, 'up')
+    assert tool.text == 'b'
+    change_event.assert_called_once_with('b')
+    submit_event.assert_not_called()
+    _textbox_press(ax, 'down')  # back to draft
+    assert tool.text == 'd'
+
+    # Pressing down while editing the draft line is a no-op.
+    change_event.reset_mock()
+    _textbox_press(ax, 'down')
+    change_event.assert_not_called()
+    submit_event.assert_not_called()
+
+    # Empty submissions are not stored.
+    _textbox_press(ax, 'backspace')
+    assert tool.text == ''
+    submit_event.reset_mock()
+    _textbox_press(ax, 'enter')
+    submit_event.assert_called_once_with('')
+    assert tool.get_history() == ['a', 'b']
+
+    # Editing a recalled entry does not mutate the stored history; only
+    # pressing enter creates a new submission.
+    _textbox_press(ax, 'up')
+    _textbox_press(ax, 'up')
+    assert tool.text == 'a'
+    _textbox_press(ax, 'z')
+    assert tool.text == 'az'
+    assert tool.get_history() == ['a', 'b']
+    submit_event.reset_mock()
+    _textbox_press(ax, 'enter')
+    assert tool.get_history() == ['a', 'b', 'az']
+    submit_event.assert_called_once_with('az')
+
+    # set_val does not record history by default; add_history opt-in does.
+    tool.set_val('prog')
+    assert tool.get_history() == ['a', 'b', 'az']
+    tool.set_val('prog2', add_history=True)
+    assert tool.get_history() == ['a', 'b', 'az', 'prog2']
+    submit_event.reset_mock()
+    tool.set_val('prog2')  # same value: nothing happens
+    submit_event.assert_not_called()
+
+    # Losing focus while browsing ends navigation and submits the visible
+    # text, which stays as the draft for the next editing session.
+    _textbox_focus(ax)
+    _textbox_press(ax, 'x')  # 'prog2x' draft
+    _textbox_press(ax, 'up')
+    assert tool.text == 'prog2'
+    submit_event.reset_mock()
+    _textbox_blur(ax)
+    submit_event.assert_called_once_with('prog2')
+    assert tool._histidx is None
+    assert tool._history_draft is None
+    assert tool.text == 'prog2'
+    # 'prog2' was already the most recent submission, so it is merged.
+    assert tool.get_history() == ['a', 'b', 'az', 'prog2']
+
+    # Refocus starts in normal editing state; the visible text is the draft.
+    _textbox_focus(ax)
+    assert tool._histidx is None
+    _textbox_press(ax, 'q')
+    assert tool.text == 'prog2q'
+    _textbox_press(ax, 'up')
+    assert tool.text == 'prog2'
+    _textbox_press(ax, 'down')
+    assert tool.text == 'prog2q'
+
+    # Disabling the widget ends browsing like losing focus.
+    _textbox_press(ax, 'up')
+    assert tool._histidx is not None
+    submit_event.reset_mock()
+    change_event.reset_mock()
+    tool.active = False
+    assert tool._histidx is None
+    assert not tool.capturekeystrokes
+    submit_event.assert_called_once_with('prog2')
+    # No key presses are processed while inactive.
+    _textbox_press(ax, 'x')
+    change_event.assert_not_called()
+    assert tool.text == 'prog2'
+    # Re-enabling and refocusing starts from a normal editing state.
+    tool.active = True
+    _textbox_focus(ax)
+    assert tool._histidx is None
+    _textbox_press(ax, 'x')
+    assert tool.text == 'prog2x'
+
+    # clear_history empties the buffer and leaves browsing state reset.
+    _textbox_press(ax, 'up')  # some browsing state
+    tool.clear_history()
+    assert tool.get_history() == []
+    assert tool._histidx is None
+    assert tool._history_draft is None
+
+
+def test_TextBox_history_capacity(ax):
+    tool = widgets.TextBox(ax, '', history=True, history_length=2)
+    _textbox_focus(ax)
+    previous = ''
+    for value in ['one', 'two', 'three']:
+        for _ in previous:  # clear the line kept after submit
+            _textbox_press(ax, 'backspace')
+        for ch in value:
+            _textbox_press(ax, ch)
+        _textbox_press(ax, 'enter')
+        previous = value
+    assert tool.get_history() == ['two', 'three']
+    # Only the surviving entries can be browsed.
+    _textbox_press(ax, 'up')
+    assert tool.text == 'three'
+    _textbox_press(ax, 'up')
+    assert tool.text == 'two'
+    change_before = tool.text
+    _textbox_press(ax, 'up')
+    assert tool.text == change_before  # oldest 'one' was evicted
+
+
+@pytest.mark.filterwarnings("ignore:Glyph .* missing from font:UserWarning")
+def test_TextBox_history_unicode(ax):
+    tool = widgets.TextBox(ax, '', history=True)
+    _textbox_focus(ax)
+
+    for value in ['你好', 'αβ']:
+        for ch in value:
+            _textbox_press(ax, ch)
+        _textbox_press(ax, 'enter')
+        for _ in value:  # clear the line kept after submit
+            _textbox_press(ax, 'backspace')
+    _textbox_press(ax, '😄')
+    _textbox_press(ax, 'enter')
+    assert tool.get_history() == ['你好', 'αβ', '😄']
+
+    _textbox_press(ax, 'up')
+    assert tool.text == '😄'
+    assert tool.cursor_index == 1  # one code point, incl. astral chars
+    _textbox_press(ax, 'up')
+    assert tool.text == 'αβ'
+    assert tool.cursor_index == 2
+    _textbox_press(ax, 'up')
+    assert tool.text == '你好'
+    assert tool.cursor_index == 2
+
+    # Cursor movement and editing use code points, not bytes or UTF-16 units.
+    _textbox_press(ax, 'left')
+    assert tool.cursor_index == 1
+    _textbox_press(ax, 'backspace')
+    assert tool.text == '好'
+    assert tool.cursor_index == 0
+    # The stored history entry is untouched by editing the recalled copy.
+    assert tool.get_history() == ['你好', 'αβ', '😄']
+
+    # Moving forward restores entries and finally the post-submit draft.
+    _textbox_press(ax, 'down')
+    assert tool.text == 'αβ'
+    _textbox_press(ax, 'down')
+    assert tool.text == '😄'
+    _textbox_press(ax, 'down')
+    assert tool.text == '😄'  # draft was the visible text after submitting
+    assert tool._histidx is None
+    submit_event = mock.Mock(spec=noop, return_value=None)
+    tool.on_submit(submit_event)
+    _textbox_press(ax, 'enter')
+    # Resubmitting the same most recent text merges instead of duplicating.
+    assert tool.get_history() == ['你好', 'αβ', '😄']
+    submit_event.assert_called_once_with('😄')
+
+
 def test_RadioButtons(ax):
     radio = widgets.RadioButtons(ax, ('Radio 1', 'Radio 2', 'Radio 3'))
     radio.set_active(1)
