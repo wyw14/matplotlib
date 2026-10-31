@@ -483,6 +483,356 @@ def test_rectangle_add_remove_set(ax):
         assert len(tool._state) == 0
 
 
+def _assert_selector_handles_in_sync(tool):
+    # The corner, edge, and center handles must match the (possibly rotated)
+    # patch geometry.
+    assert_allclose(tool._corner_handles.x, tool.corners[0])
+    assert_allclose(tool._corner_handles.y, tool.corners[1])
+    assert_allclose(tool._edge_handles.x, tool.edge_centers[0])
+    assert_allclose(tool._edge_handles.y, tool.edge_centers[1])
+    assert_allclose(tool._center_handle.x, [tool.center[0]])
+    assert_allclose(tool._center_handle.y, [tool.center[1]])
+
+
+@pytest.mark.parametrize('selector_class',
+                         [widgets.RectangleSelector, widgets.EllipseSelector])
+@pytest.mark.parametrize('useblit', [False, True])
+def test_rectangle_undo_redo_basic(ax, selector_class, useblit):
+    onselect = mock.Mock(spec=noop, return_value=None)
+    tool = selector_class(ax, onselect, interactive=True, useblit=useblit,
+                          enable_undo_redo=True)
+    # The initial (empty) state is the sole baseline entry.
+    assert len(tool._undo_stack) == 1
+    assert tool.undo() is False
+    assert tool.redo() is False
+    onselect.assert_not_called()
+
+    # Create a selection: one history entry for the whole drag.
+    click_and_drag(tool, start=(10, 10), end=(50, 60))
+    assert tool.extents == (10.0, 50.0, 10.0, 60.0)
+    assert tool._selection_completed
+    assert len(tool._undo_stack) == 2
+
+    # Move it by dragging the center handle.
+    click_and_drag(tool, start=(30, 35), end=(40, 45))
+    assert tool.extents == (20.0, 60.0, 20.0, 70.0)
+
+    # Resize it by dragging the NE corner handle.
+    click_and_drag(tool, start=(60, 70), end=(70, 85))
+    assert tool.extents == (20.0, 70.0, 20.0, 85.0)
+    # Three completed interactions -> three entries above the baseline.
+    assert len(tool._undo_stack) == 4
+    n_states = len(tool._undo_stack) + len(tool._redo_stack)
+
+    onselect.reset_mock()
+    # Undo resize, move, and create: one callback per successful restore.
+    assert tool.undo() is True
+    assert tool.extents == (20.0, 60.0, 20.0, 70.0)
+    _assert_selector_handles_in_sync(tool)
+    # The single restore callback carries the restored extents.
+    (epress, erelease), _ = onselect.call_args
+    assert (epress.xdata, epress.ydata) == (20.0, 20.0)
+    assert (erelease.xdata, erelease.ydata) == (60.0, 70.0)
+    assert tool.undo() is True
+    assert tool.extents == (10.0, 50.0, 10.0, 60.0)
+    assert tool.undo() is True
+    assert not tool._selection_completed
+    assert not tool._selection_artist.get_visible()
+    assert all(not artist.get_visible() for artist in tool._handles_artists)
+    # Nothing more to undo, and a failed restore does not call onselect.
+    assert tool.undo() is False
+    assert onselect.call_count == 3
+
+    # Redo all the way back: one callback per successful restore.
+    assert tool.redo() is True
+    assert tool.extents == (10.0, 50.0, 10.0, 60.0)
+    assert tool._selection_completed
+    assert tool._selection_artist.get_visible()
+    assert all(artist.get_visible() for artist in tool._handles_artists)
+    assert tool.redo() is True
+    assert tool.redo() is True
+    assert tool.extents == (20.0, 70.0, 20.0, 85.0)
+    _assert_selector_handles_in_sync(tool)
+    assert tool.redo() is False
+    assert onselect.call_count == 6
+    # Restoring states never records anything itself: the total number of
+    # stored states is unchanged by undo/redo.
+    assert len(tool._undo_stack) + len(tool._redo_stack) == n_states
+
+    # clear_history keeps the current state as the new baseline.
+    tool.clear_history()
+    assert len(tool._undo_stack) == 1
+    assert not tool._redo_stack
+    assert tool.undo() is False
+    assert tool.redo() is False
+
+
+@pytest.mark.parametrize('selector_class',
+                         [widgets.RectangleSelector, widgets.EllipseSelector])
+def test_rectangle_undo_redo_rotate(ax, selector_class):
+    onselect = mock.Mock(spec=noop, return_value=None)
+    tool = selector_class(ax, onselect, interactive=True,
+                          enable_undo_redo=True)
+    click_and_drag(tool, start=(100, 100), end=(130, 140))
+    assert tool.extents == (100, 130, 100, 140)
+
+    # Rotate anticlockwise using the top-right corner.
+    KeyEvent("key_press_event", ax.figure.canvas, "r")._process()
+    click_and_drag(tool, start=(130, 140), end=(120, 145))
+    KeyEvent("key_press_event", ax.figure.canvas, "r")._process()
+    assert_allclose(tool.rotation, 25.56, atol=0.01)
+    assert tool.extents == (100, 130, 100, 140)
+    assert len(tool._undo_stack) == 3
+
+    onselect.reset_mock()
+    # Undoing the rotation restores the angle, patch, and handles.
+    assert tool.undo() is True
+    assert_allclose(tool.rotation, 0, atol=1e-8)
+    assert tool.extents == (100, 130, 100, 140)
+    _assert_selector_handles_in_sync(tool)
+    onselect.assert_called_once()
+
+    # Redoing it brings the rotated selection back.
+    assert tool.redo() is True
+    assert_allclose(tool.rotation, 25.56, atol=0.01)
+    assert tool.extents == (100, 130, 100, 140)
+    _assert_selector_handles_in_sync(tool)
+    # The rotated corners visibly differ from the unrotated ones.
+    assert not np.allclose(tool.corners[0], (100, 130, 130, 100))
+
+    # Undo further: the unrotated selection is removed, then recreated.
+    assert tool.undo() is True
+    assert_allclose(tool.rotation, 0, atol=1e-8)
+    assert tool.undo() is True
+    assert not tool._selection_completed
+    assert tool.redo() is True
+    assert tool.redo() is True
+    assert_allclose(tool.rotation, 25.56, atol=0.01)
+    assert tool._selection_completed
+
+
+def test_rectangle_undo_redo_clear(ax):
+    onselect = mock.Mock(spec=noop, return_value=None)
+    tool = widgets.RectangleSelector(ax, onselect, interactive=True,
+                                     enable_undo_redo=True)
+    click_and_drag(tool, start=(10, 10), end=(60, 70))
+    assert tool.extents == (10.0, 60.0, 10.0, 70.0)
+
+    # Escape clears the selection and records the empty state.
+    KeyEvent("key_press_event", ax.figure.canvas, "escape")._process()
+    assert not tool._selection_completed
+    assert len(tool._undo_stack) == 3
+
+    # Clearing an already-empty selector does not record anything.
+    KeyEvent("key_press_event", ax.figure.canvas, "escape")._process()
+    assert not tool._selection_completed
+    assert len(tool._undo_stack) == 3
+
+    assert tool.undo() is True
+    assert tool._selection_completed
+    assert tool.extents == (10.0, 60.0, 10.0, 70.0)
+    assert tool._selection_artist.get_visible()
+    assert all(artist.get_visible() for artist in tool._handles_artists)
+
+    # A programmatic clear while a selection exists is recorded too (and
+    # discards the redo branch, like any new edit after an undo).
+    tool.clear()
+    assert not tool._selection_completed
+    assert len(tool._undo_stack) == 3
+    assert not tool._redo_stack
+    assert tool.undo() is True
+    assert tool._selection_completed
+    assert tool.extents == (10.0, 60.0, 10.0, 70.0)
+
+
+def test_rectangle_undo_redo_cancel_and_small_selection(ax):
+    tool = widgets.RectangleSelector(ax, interactive=True,
+                                     enable_undo_redo=True,
+                                     minspanx=5, minspany=5)
+    # An invalid (too small) drag on empty Axes is cancelled and not recorded.
+    click_and_drag(tool, start=(10, 10), end=(12, 12))
+    assert not tool._selection_completed
+    assert len(tool._undo_stack) == 1
+    assert tool.undo() is False
+
+    # A valid selection is recorded.
+    click_and_drag(tool, start=(20, 20), end=(80, 90))
+    assert tool.extents == (20.0, 80.0, 20.0, 90.0)
+    assert len(tool._undo_stack) == 2
+
+    # An invalid small drag cancels: the previous selection is kept (both
+    # patch and handles) and nothing is recorded.
+    click_and_drag(tool, start=(10, 10), end=(11, 11))
+    assert tool._selection_completed
+    assert tool.extents == (20.0, 80.0, 20.0, 90.0)
+    assert tool._selection_artist.get_visible()
+    assert all(artist.get_visible() for artist in tool._handles_artists)
+    assert len(tool._undo_stack) == 2
+
+    # A press/release on the center handle without any movement leaves the
+    # selector unchanged and is not recorded.
+    cx, cy = tool.center
+    click_and_drag(tool, start=(cx, cy), end=(cx, cy))
+    assert tool.extents == (20.0, 80.0, 20.0, 90.0)
+    assert len(tool._undo_stack) == 2
+
+    # With ignore_event_outside, a press/release away from the selection is a
+    # no-op and not recorded.
+    onselect = mock.Mock(spec=noop, return_value=None)
+    tool2 = widgets.RectangleSelector(ax, onselect, interactive=True,
+                                      enable_undo_redo=True,
+                                      ignore_event_outside=True)
+    click_and_drag(tool2, start=(100, 100), end=(130, 140))
+    assert tool2.extents == (100.0, 130.0, 100.0, 140.0)
+    onselect.assert_called_once()
+    onselect.reset_mock()
+    click_and_drag(tool2, start=(150, 150), end=(160, 160))
+    assert tool2.extents == (100.0, 130.0, 100.0, 140.0)
+    assert len(tool2._undo_stack) == 2
+    onselect.assert_not_called()
+
+
+def test_rectangle_undo_redo_branch_and_capacity(ax):
+    with pytest.raises(ValueError):
+        widgets.RectangleSelector(
+            ax, enable_undo_redo=True, undo_redo_history_size=0)
+    with pytest.raises(TypeError):
+        widgets.RectangleSelector(
+            ax, enable_undo_redo=True, undo_redo_history_size='bad')
+
+    tool = widgets.RectangleSelector(ax, interactive=True,
+                                     enable_undo_redo=True,
+                                     undo_redo_history_size=3)
+    click_and_drag(tool, start=(10, 10), end=(20, 20))
+    click_and_drag(tool, start=(30, 30), end=(40, 40))
+    click_and_drag(tool, start=(50, 50), end=(60, 60))
+    click_and_drag(tool, start=(70, 70), end=(80, 80))
+    # The history is capped and the oldest state has been forgotten.
+    assert len(tool._undo_stack) == 3
+    assert tool.undo() is True
+    assert tool.extents == (50.0, 60.0, 50.0, 60.0)
+    assert tool.undo() is True
+    assert tool.extents == (30.0, 40.0, 30.0, 40.0)
+    assert tool.undo() is False
+
+    # A new edit after an undo discards the redo branch.
+    assert tool.redo() is True
+    click_and_drag(tool, start=(90, 90), end=(100, 100))
+    assert not tool._redo_stack
+    assert tool.redo() is False
+    assert tool.undo() is True
+    assert tool.extents == (50.0, 60.0, 50.0, 60.0)
+    assert tool.undo() is True
+    assert tool.extents == (30.0, 40.0, 30.0, 40.0)
+    assert tool.undo() is False
+
+
+def test_rectangle_undo_redo_axes_limits(ax):
+    tool = widgets.RectangleSelector(ax, interactive=True,
+                                     enable_undo_redo=True)
+    click_and_drag(tool, start=(20, 20), end=(80, 90))
+    xlim0 = ax.get_xlim()
+    ylim0 = ax.get_ylim()
+
+    # Pan/zoom the Axes, then move the selection within the new view.
+    ax.set_xlim(0, 100)
+    ax.set_ylim(0, 100)
+    ax.figure.canvas.draw()
+    click_and_drag(tool, start=(50, 55), end=(55, 60))
+    assert_allclose(tool.extents, (25.0, 85.0, 25.0, 95.0))
+    assert_allclose(ax.get_xlim(), (0, 100))
+    assert_allclose(ax.get_ylim(), (0, 100))
+
+    # Undoing restores both the selection and the previous view limits,
+    # without clipping the patch, and resynchronizes the handles.
+    assert tool.undo() is True
+    assert_allclose(ax.get_xlim(), xlim0)
+    assert_allclose(ax.get_ylim(), ylim0)
+    assert tool.extents == (20.0, 80.0, 20.0, 90.0)
+    _assert_selector_handles_in_sync(tool)
+
+    # Redo restores the moved selection and the later view limits.
+    assert tool.redo() is True
+    assert_allclose(ax.get_xlim(), (0, 100))
+    assert_allclose(ax.get_ylim(), (0, 100))
+    assert_allclose(tool.extents, (25.0, 85.0, 25.0, 95.0))
+    _assert_selector_handles_in_sync(tool)
+
+
+def test_rectangle_undo_redo_multi_instance():
+    # Two selectors on two Axes have fully independent histories.
+    fig, (ax1, ax2) = plt.subplots(2)
+    for ax_ in (ax1, ax2):
+        ax_.set_xlim(0, 200)
+        ax_.set_ylim(0, 200)
+        ax_.set_aspect(1)
+    fig.canvas.draw()
+
+    onselect1 = mock.Mock(spec=noop, return_value=None)
+    onselect2 = mock.Mock(spec=noop, return_value=None)
+    tool1 = widgets.RectangleSelector(ax1, onselect1, interactive=True,
+                                      enable_undo_redo=True)
+    tool2 = widgets.RectangleSelector(ax2, onselect2, interactive=True,
+                                      enable_undo_redo=True,
+                                      undo_redo_history_size=2)
+    click_and_drag(tool1, start=(10, 10), end=(40, 50))
+    click_and_drag(tool2, start=(60, 60), end=(90, 100))
+    assert tool1.extents == (10.0, 40.0, 10.0, 50.0)
+    assert tool2.extents == (60.0, 90.0, 60.0, 100.0)
+    assert tool1._undo_stack is not tool2._undo_stack
+
+    onselect1.reset_mock()
+    onselect2.reset_mock()
+    assert tool1.undo() is True
+    # Only tool1 changed.
+    assert not tool1._selection_completed
+    assert tool2._selection_completed
+    assert tool2.extents == (60.0, 90.0, 60.0, 100.0)
+    onselect1.assert_called_once()
+    onselect2.assert_not_called()
+    assert tool1.undo() is False
+    assert tool2.undo() is True
+    assert not tool2._selection_completed
+    assert tool2.undo() is False
+
+    # Two selectors sharing one Axes also keep independent histories:
+    # canvas events reach both, but an undo on one does not touch the other.
+    fig3, ax3 = plt.subplots()
+    ax3.set_xlim(0, 200)
+    ax3.set_ylim(0, 200)
+    tool3 = widgets.RectangleSelector(ax3, interactive=True,
+                                      enable_undo_redo=True)
+    tool4 = widgets.RectangleSelector(ax3, interactive=True,
+                                      enable_undo_redo=True)
+    click_and_drag(tool3, start=(10, 10), end=(50, 60))
+    assert tool3._selection_completed and tool4._selection_completed
+    assert len(tool3._undo_stack) == len(tool4._undo_stack) == 2
+    assert tool3.undo() is True
+    assert not tool3._selection_completed
+    assert tool4._selection_completed
+    assert tool4.extents == (10.0, 50.0, 10.0, 60.0)
+    assert tool4.undo() is True
+    assert not tool4._selection_completed
+
+
+def test_rectangle_undo_redo_disabled_by_default(ax):
+    onselect = mock.Mock(spec=noop, return_value=None)
+    tool = widgets.RectangleSelector(ax, onselect, interactive=True)
+    assert tool._undo_redo_enabled is False
+    click_and_drag(tool, start=(10, 10), end=(50, 60))
+    # No history is kept and undo/redo are inert.
+    assert tool._undo_stack == []
+    assert tool._redo_stack == []
+    assert tool.undo() is False
+    assert tool.redo() is False
+    # clear_history is a harmless no-op and normal interaction still works.
+    tool.clear_history()
+    onselect.assert_called_once()
+    assert tool.extents == (10.0, 50.0, 10.0, 60.0)
+    tool.clear()
+    assert not tool._selection_completed
+
+
 @pytest.mark.parametrize('use_data_coordinates', [False, True])
 def test_rectangle_resize_square_center_aspect(ax, use_data_coordinates):
     ax.set_aspect(0.8)

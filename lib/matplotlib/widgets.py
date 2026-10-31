@@ -14,6 +14,7 @@ import functools
 import itertools
 import weakref
 from numbers import Integral, Number
+from types import SimpleNamespace
 
 from cycler import cycler
 import numpy as np
@@ -3364,7 +3365,60 @@ _RECTANGLESELECTOR_PARAMETERS_DOCSTRING = \
     use_data_coordinates : bool, default: False
         If `True`, the "square" shape of the selector is defined in
         data coordinates instead of display coordinates.
+
+    enable_undo_redo : bool, default: False
+        If `True`, keep a history of the selector states (selection extents,
+        rotation, presence of a selection, and Axes view limits), enabling
+        `undo`, `redo`, and `clear_history`.  A state is recorded only once,
+        when a create, move, resize, rotate, or clear operation completes;
+        the intermediate motion events of a drag are not recorded.  Drawn
+        selections that are smaller than *minspanx*/*minspany*, and
+        operations that leave the selector unchanged, cancel the
+        interaction: the previous state is restored and nothing is recorded.
+        Making a new edit after an undo discards the redo history.
+
+    undo_redo_history_size : int, default: 100
+        Maximum number of states kept in the undo/redo history, including the
+        current state.  When the history is full, the oldest state is
+        discarded.  Has no effect if *enable_undo_redo* is False.
     """
+
+
+class _SelectorHistoryState:
+    """
+    Snapshot of a selector state used by the undo/redo history of
+    `.RectangleSelector`.
+
+    A state captures the selection extents in data coordinates, the rotation
+    in degrees, whether a completed selection is present, and the Axes view
+    limits at the time of the snapshot (so that the selection can be restored
+    faithfully after a pan or zoom).
+    """
+
+    __slots__ = ("extents", "rotation", "completed", "xlim", "ylim")
+
+    def __init__(self, extents, rotation, completed, xlim, ylim):
+        self.extents = tuple(float(v) for v in extents)
+        self.rotation = float(rotation)
+        self.completed = bool(completed)
+        self.xlim = tuple(float(v) for v in xlim)
+        self.ylim = tuple(float(v) for v in ylim)
+
+    def __eq__(self, other):
+        if not isinstance(other, _SelectorHistoryState):
+            return NotImplemented
+        # Empty states are normalized on creation, so they compare equal
+        # regardless of the (invisible) geometry left on the artist.
+        return (self.completed == other.completed
+                and np.allclose(self.extents, other.extents)
+                and np.isclose(self.rotation, other.rotation)
+                and np.allclose(self.xlim, other.xlim)
+                and np.allclose(self.ylim, other.ylim))
+
+    def __repr__(self):
+        return (f"_SelectorHistoryState(extents={self.extents}, "
+                f"rotation={self.rotation}, completed={self.completed}, "
+                f"xlim={self.xlim}, ylim={self.ylim})")
 
 
 class _RectangleSelectorAction(enum.Enum):
@@ -3411,10 +3465,18 @@ class RectangleSelector(_SelectorWidget):
                  props=None, spancoords='data', button=None, grab_range=10,
                  handle_props=None, interactive=False,
                  state_modifier_keys=None, drag_from_anywhere=False,
-                 ignore_event_outside=False, use_data_coordinates=False):
+                 ignore_event_outside=False, use_data_coordinates=False,
+                 enable_undo_redo=False, undo_redo_history_size=100):
         super().__init__(ax, onselect, useblit=useblit, button=button,
                          state_modifier_keys=state_modifier_keys,
                          use_data_coordinates=use_data_coordinates)
+
+        _api.check_isinstance(bool, enable_undo_redo=enable_undo_redo)
+        _api.check_isinstance(int,
+                              undo_redo_history_size=undo_redo_history_size)
+        if undo_redo_history_size < 1:
+            raise ValueError(
+                'undo_redo_history_size must be strictly positive')
 
         self._interactive = interactive
         self.drag_from_anywhere = drag_from_anywhere
@@ -3472,6 +3534,23 @@ class RectangleSelector(_SelectorWidget):
 
         self._extents_on_press = None
 
+        # Optional undo/redo history.  ``_undo_stack`` always holds the
+        # current state as its last entry (the initial, empty state being
+        # the baseline); ``_redo_stack`` holds the states reachable with
+        # `redo`.
+        self._undo_redo_enabled = enable_undo_redo
+        self._undo_redo_history_size = undo_redo_history_size
+        # Reentrancy guard: restoring a state must never be recorded itself.
+        self._restoring_history = False
+        # Snapshot taken at button press, to detect at release whether the
+        # interaction actually changed the selector (cancelled/no-op
+        # interactions are not recorded).
+        self._state_on_press = None
+        self._undo_stack = []
+        self._redo_stack = []
+        if self._undo_redo_enabled:
+            self._undo_stack.append(self._get_history_state())
+
     @property
     def _handles_artists(self):
         return (*self._center_handle.artists, *self._corner_handles.artists,
@@ -3483,6 +3562,11 @@ class RectangleSelector(_SelectorWidget):
 
     def _press(self, event):
         """Button press event handler."""
+        # Snapshot the state before the interaction starts (before any
+        # geometry is changed), so that a cancelled/no-op interaction is not
+        # recorded in the undo/redo history.
+        self._state_on_press = (self._get_history_state()
+                                if self._undo_redo_enabled else None)
         # make the drawn box/line visible get the click-coordinates, button, ...
         if self._interactive and self._selection_artist.get_visible():
             self._set_active_handle(event)
@@ -3529,6 +3613,8 @@ class RectangleSelector(_SelectorWidget):
 
         if (self._active_handle is None and self._selection_completed and
                 self.ignore_event_outside):
+            # Nothing changed: the event is ignored, so nothing is recorded.
+            self._state_on_press = None
             return
 
         # update the eventpress and eventrelease with the resulting extents
@@ -3556,6 +3642,18 @@ class RectangleSelector(_SelectorWidget):
         # check if drawn distance (if it exists) is not too small in
         # either x or y-direction
         if spanx <= self.minspanx or spany <= self.minspany:
+            if self._undo_redo_enabled:
+                # The interaction produced an invalid (too small) selection:
+                # treat it as cancelled by restoring the state as it was
+                # before the press.  Cancelled interactions are not recorded
+                # in the history (and do not clear an existing selection).
+                state_on_press = self._state_on_press
+                self._state_on_press = None
+                if state_on_press is not None:
+                    self._restore_history_state(state_on_press)
+                self._active_handle = None
+                self._extents_on_press = None
+                return False
             if self._selection_completed:
                 # Call onselect, only when the selection is already existing
                 self.onselect(self._eventpress, self._eventrelease)
@@ -3567,6 +3665,9 @@ class RectangleSelector(_SelectorWidget):
         self.update()
         self._active_handle = None
         self._extents_on_press = None
+        # Record the outcome of the interaction exactly once: only if it
+        # produced a different state than the one captured at press time.
+        self._record_history_after_interaction()
         return False
 
     def _get_action(self):
@@ -3880,6 +3981,172 @@ class RectangleSelector(_SelectorWidget):
             return np.array([x, y])
         else:
             return np.array(self._selection_artist.get_data())
+
+    def clear(self):
+        """
+        Clear the selection and, if undo/redo is enabled, record the empty
+        state in the history (only when a selection was present).
+        """
+        had_selection = self._selection_completed
+        super().clear()
+        if had_selection:
+            self._commit_history_state()
+
+    def _get_history_state(self):
+        """Return a `_SelectorHistoryState` snapshot of the current state."""
+        if self._selection_completed:
+            extents = self.extents
+            rotation = self.rotation
+        else:
+            # The hidden geometry left on the artist is irrelevant when no
+            # selection exists; normalize it so that e.g. an invalid small
+            # drag on an empty Axes compares equal to the previous empty
+            # state and is not recorded.
+            extents = (0.0, 0.0, 0.0, 0.0)
+            rotation = 0.0
+        return _SelectorHistoryState(
+            extents, rotation, self._selection_completed,
+            self.ax.get_xlim(), self.ax.get_ylim())
+
+    def _commit_history_state(self, state=None):
+        """
+        Record *state* (default: the current state) as the latest history
+        entry, discarding the redo branch.
+
+        Do nothing if undo/redo is disabled, while a state is being restored,
+        or if the state equals the current history entry.
+        """
+        if not self._undo_redo_enabled or self._restoring_history:
+            return
+        if state is None:
+            state = self._get_history_state()
+        if self._undo_stack and state == self._undo_stack[-1]:
+            return
+        self._redo_stack.clear()
+        self._undo_stack.append(state)
+        if len(self._undo_stack) > self._undo_redo_history_size:
+            del self._undo_stack[:-self._undo_redo_history_size]
+
+    def _record_history_after_interaction(self):
+        """
+        Record the outcome of a press/release interaction, but only if it
+        resulted in a state different from the one captured when the
+        interaction started (invalid selections and cancelled/no-op
+        interactions are then skipped).
+        """
+        state_on_press = self._state_on_press
+        self._state_on_press = None
+        if not self._undo_redo_enabled or self._restoring_history:
+            return
+        state = self._get_history_state()
+        if state != state_on_press:
+            self._commit_history_state(state)
+
+    def _restore_history_state(self, state):
+        """Update the patch, handles, and Axes limits to match *state*."""
+        self._restoring_history = True
+        try:
+            # Restore the view limits first, so that setting the extents is
+            # not clipped by limits that changed after the state was recorded.
+            self.ax.set_xlim(state.xlim)
+            self.ax.set_ylim(state.ylim)
+            self._set_aspect_ratio_correction()
+            if state.completed:
+                self._selection_completed = True
+                self._visible = True
+                self._rotation = np.deg2rad(state.rotation)
+                # The extents setter redraws the shape and synchronizes all
+                # handles (corners, edges, center).
+                self.extents = state.extents
+                if not self._interactive:
+                    # A non-interactive selector hides its patch after a
+                    # release; keep its restored state consistent with that.
+                    self._selection_artist.set_visible(False)
+            else:
+                self._clear_without_update()
+            if self.useblit:
+                self.update_background(None)
+            self.update()
+        finally:
+            self._restoring_history = False
+
+    def _emit_history_callback(self):
+        """
+        Call *onselect* once with synthetic click/release events matching the
+        extents of the current (restored) state.
+        """
+        x0, x1, y0, y1 = self._undo_stack[-1].extents
+        xy0 = self.ax.transData.transform([x0, y0])
+        xy1 = self.ax.transData.transform([x1, y1])
+        eclick = SimpleNamespace(xdata=x0, ydata=y0, x=xy0[0], y=xy0[1],
+                                 button=None, key=None, inaxes=self.ax)
+        erelease = SimpleNamespace(xdata=x1, ydata=y1, x=xy1[0], y=xy1[1],
+                                   button=None, key=None, inaxes=self.ax)
+        self.onselect(eclick, erelease)
+
+    def undo(self):
+        """
+        Restore the previous state of the selector.
+
+        The selection patch, the handles, and the Axes view limits are
+        synchronized to the restored state, and *onselect* is called once.
+        Restoring a state is never itself recorded in the history.
+
+        .. versionadded:: 3.13
+
+        Returns
+        -------
+        bool
+            `True` if a previous state was restored, `False` if there is
+            nothing to undo (undo/redo disabled or history at the oldest
+            state).
+        """
+        if not self._undo_redo_enabled or len(self._undo_stack) <= 1:
+            return False
+        self._redo_stack.append(self._undo_stack.pop())
+        self._restore_history_state(self._undo_stack[-1])
+        self._emit_history_callback()
+        return True
+
+    def redo(self):
+        """
+        Restore the state that was previously undone with `undo`.
+
+        The selection patch, the handles, and the Axes view limits are
+        synchronized to the restored state, and *onselect* is called once.
+        Restoring a state is never itself recorded in the history.
+
+        .. versionadded:: 3.13
+
+        Returns
+        -------
+        bool
+            `True` if a state was restored, `False` if there is nothing to
+            redo (undo/redo disabled or redo history empty, in particular
+            after a new edit).
+        """
+        if not self._undo_redo_enabled or not self._redo_stack:
+            return False
+        state = self._redo_stack.pop()
+        self._undo_stack.append(state)
+        self._restore_history_state(state)
+        self._emit_history_callback()
+        return True
+
+    def clear_history(self):
+        """
+        Clear the undo/redo history.
+
+        The selector itself is left unchanged; its current state becomes the
+        sole (baseline) entry of the history, so that subsequent edits can
+        still be undone back to it.
+
+        .. versionadded:: 3.13
+        """
+        if not self._undo_redo_enabled:
+            return
+        self._undo_stack = [self._get_history_state()]
+        self._redo_stack.clear()
 
 
 @_docstring.Substitution(_RECTANGLESELECTOR_PARAMETERS_DOCSTRING.replace(
